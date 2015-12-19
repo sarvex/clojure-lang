@@ -63,7 +63,7 @@
         methods (map (fn [[name params & body]]
                        (cons name (maybe-destructured params body)))
                      (apply concat (vals impls)))]
-    (when-let [bad-opts (seq (remove #{:no-print} (keys opts)))]
+    (when-let [bad-opts (seq (remove #{:no-print :load-ns} (keys opts)))]
       (throw (IllegalArgumentException. (apply print-str "Unsupported option(s) -" bad-opts))))
     [interfaces methods opts]))
 
@@ -132,7 +132,7 @@
 (defn- imap-cons
   [^IPersistentMap this o]
   (cond
-   (instance? java.util.Map$Entry o)
+   (map-entry? o)
      (let [^java.util.Map$Entry pair o]
        (.assoc this (.getKey pair) (.getValue pair)))
    (instance? clojure.lang.IPersistentVector o)
@@ -148,8 +148,8 @@
 (defn- emit-defrecord 
   "Do not use this directly - use defrecord"
   {:added "1.2"}
-  [tagname name fields interfaces methods]
-  (let [classname (with-meta (symbol (str (namespace-munge *ns*) "." name)) (meta name))
+  [tagname cname fields interfaces methods opts]
+  (let [classname (with-meta (symbol (str (namespace-munge *ns*) "." cname)) (meta cname))
         interfaces (vec interfaces)
         interface-set (set (map resolve interfaces))
         methodname-set (set (map first methods))
@@ -212,10 +212,11 @@
                    `(containsKey [this# k#] (not (identical? this# (.valAt this# k# this#))))
                    `(entryAt [this# k#] (let [v# (.valAt this# k# this#)]
                                             (when-not (identical? this# v#)
-                                              (clojure.lang.MapEntry. k# v#))))
-                   `(seq [this#] (seq (concat [~@(map #(list `new `clojure.lang.MapEntry (keyword %) %) base-fields)] 
+                                              (clojure.lang.MapEntry/create k# v#))))
+                   `(seq [this#] (seq (concat [~@(map #(list `clojure.lang.MapEntry/create (keyword %) %) base-fields)]
                                               ~'__extmap)))
-                   `(iterator [this#] (clojure.lang.SeqIterator. (.seq this#)))
+                   `(iterator [~gs]
+                        (clojure.lang.RecordIterator. ~gs [~@(map keyword base-fields)] (RT/iter ~'__extmap)))
                    `(assoc [this# k# ~gs]
                      (condp identical? k#
                        ~@(mapcat (fn [fld]
@@ -242,8 +243,9 @@
                        `(entrySet [this#] (set this#)))])
       ]
      (let [[i m] (-> [interfaces methods] irecord eqhash iobj ilookup imap ijavamap)]
-       `(deftype* ~tagname ~classname ~(conj hinted-fields '__meta '__extmap) 
+       `(deftype* ~(symbol (name (ns-name *ns*)) (name tagname)) ~classname ~(conj hinted-fields '__meta '__extmap)
           :implements ~(vec i) 
+          ~@(mapcat identity opts)
           ~@m))))))
 
 (defn- build-positional-factory
@@ -294,8 +296,13 @@
 
 (defmacro defrecord
   "(defrecord name [fields*]  options* specs*)
-  
-  Currently there are no options.
+
+  Options are expressed as sequential keywords and arguments (in any order).
+
+  Supported options:
+  :load-ns - if true, importing the record class will cause the
+             namespace in which the record was defined to be loaded.
+             Defaults to false.
 
   Each spec consists of a protocol or interface name followed by zero
   or more method bodies:
@@ -371,7 +378,7 @@
     `(let []
        (declare ~(symbol (str  '-> gname)))
        (declare ~(symbol (str 'map-> gname)))
-       ~(emit-defrecord name gname (vec hinted-fields) (vec interfaces) methods)
+       ~(emit-defrecord name gname (vec hinted-fields) (vec interfaces) methods opts)
        (import ~classname)
        ~(build-positional-factory gname classname fields)
        (defn ~(symbol (str 'map-> gname))
@@ -389,17 +396,23 @@
 
 (defn- emit-deftype*
   "Do not use this directly - use deftype"
-  [tagname name fields interfaces methods]
-  (let [classname (with-meta (symbol (str (namespace-munge *ns*) "." name)) (meta name))
+  [tagname cname fields interfaces methods opts]
+  (let [classname (with-meta (symbol (str (namespace-munge *ns*) "." cname)) (meta cname))
         interfaces (conj interfaces 'clojure.lang.IType)]
-    `(deftype* ~tagname ~classname ~fields 
+    `(deftype* ~(symbol (name (ns-name *ns*)) (name tagname)) ~classname ~fields
        :implements ~interfaces 
+       ~@(mapcat identity opts)
        ~@methods)))
 
 (defmacro deftype
   "(deftype name [fields*]  options* specs*)
-  
-  Currently there are no options.
+
+  Options are expressed as sequential keywords and arguments (in any order).
+
+  Supported options:
+  :load-ns - if true, importing the record class will cause the
+             namespace in which the record was defined to be loaded.
+             Defaults to false.
 
   Each spec consists of a protocol or interface name followed by zero
   or more method bodies:
@@ -470,7 +483,7 @@
         fields (vec (map #(with-meta % nil) fields))
         [field-args over] (split-at 20 fields)]
     `(let []
-       ~(emit-deftype* name gname (vec hinted-fields) (vec interfaces) methods)
+       ~(emit-deftype* name gname (vec hinted-fields) (vec interfaces) methods opts)
        (import ~classname)
        ~(build-positional-factory gname classname fields)
        ~classname)))
@@ -764,7 +777,7 @@
 
 (defn- emit-impl [[p fs]]
   [p (zipmap (map #(-> % first keyword) fs)
-             (map #(cons 'fn (drop 1 %)) fs))])
+             (map #(cons `fn (drop 1 %)) fs))])
 
 (defn- emit-hinted-impl [c [p fs]]
   (let [hint (fn [specs]
@@ -776,7 +789,7 @@
                               body))
                       specs)))]
     [p (zipmap (map #(-> % first name keyword) fs)
-               (map #(cons 'fn (hint (drop 1 %))) fs))]))
+               (map #(cons `fn (hint (drop 1 %))) fs))]))
 
 (defn- emit-extend-type [c specs]
   (let [impls (parse-impls specs)]
